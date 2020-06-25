@@ -1,3 +1,14 @@
+# Our changes
+Instead of actually executing a metaflow spec this version just generates an Argo workflow YAML on stdout which can then in turn orchestrate the whole DAG on top of Argo instead of orchestrating it natively via metaflow runtime.
+
+## Limitations
+* currently not parsing the DAG properly; just sequentializing all steps (not exploiting potential concurrencies)
+* template is currently fixed to a python image; this needs more flexibility in the final version
+* no step placeholders for resource requirements
+* if input paths exceed 32k characters we cut off atm
+* AWS secrets are visible on pod level
+* current implementation does not support fanout via foreach as it's fully static and doesn't happen at runtime; for a proper fanout we would either need a mini orchestration in a pod (then again we would orchestrate without argo) or not try to generate the whole workflow statically or do orchestrate it via several argo workflows running in sequence (whereas workflow B is only generated when results of workflow A are known for a overall flow of ... -> A -> B -> ...)
+
 # Metaflow
 
 Metaflow is a human-friendly Python library that helps scientists and engineers build and manage real-life data science projects. Metaflow was originally developed at Netflix to boost productivity of data scientists who work on a wide variety of projects from classical statistics to state-of-the-art deep learning.
