@@ -24,6 +24,10 @@ from .datastore import DataException, MetaflowDatastoreSet
 from .metadata import MetaDatum
 from .debug import debug
 
+from metaflow.metaflow_config import BATCH_METADATA_SERVICE_URL, DATATOOLS_S3ROOT, \
+    DATASTORE_LOCAL_DIR, DATASTORE_SYSROOT_S3, DEFAULT_METADATA, \
+    BATCH_METADATA_SERVICE_HEADERS, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_DEFAULT_REGION
+
 from .util import to_unicode, compress_list
 try:
     # python2
@@ -44,6 +48,47 @@ PROGRESS_INTERVAL = 1000 #ms
 PREFETCH_DATA_ARTIFACTS = ['_foreach_stack', '_task_ok', '_transition']
 
 # TODO option: output dot graph periodically about execution
+
+STEP = """    - - name: $NAME
+        template: python
+        arguments:
+          parameters: 
+          - name: input_path
+            value: $INPUT_PATH
+          - name: arguments
+            value: $ARGS
+
+"""
+
+YAML = """apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: yamlisfuckingstupid
+spec:
+  entrypoint: steps
+  templates:
+  - name: python
+    inputs:
+      parameters:
+      - name: arguments
+      - name: input_path
+    container:
+      image: "python:3.6"
+      command: ["/bin/sh"]
+      args: ["-c", "{{inputs.parameters.arguments}}"]
+      env:
+      - name: METAFLOW_INPUT_PATHS_0
+        value: "{{inputs.parameters.input_path}}"
+$ENV
+      resources:
+        limits:
+          memory: $MEMORYMi
+          cpu: $CPU
+  - name: steps
+    steps:
+$STEPS
+"""
+
 
 class NativeRuntime(object):
 
@@ -85,6 +130,7 @@ class NativeRuntime(object):
         self._entrypoint = entrypoint
         self.event_logger = event_logger
         self._monitor = monitor
+        self._package = package
 
         self._clone_run_id = clone_run_id
         self._clone_steps = {} if clone_steps is None else clone_steps
@@ -127,7 +173,7 @@ class NativeRuntime(object):
         self._finished = {}
         self._is_cloned = {}
 
-        for step in flow:
+        for step in self._flow:
             for deco in step.decorators:
                 deco.runtime_init(flow,
                                   graph,
@@ -178,63 +224,160 @@ class NativeRuntime(object):
         self._is_cloned[task.path] = task.is_cloned
 
     def execute(self):
-        self._logger('Workflow starting (run-id %s):' % self._run_id,
-                     system_msg=True)
+        self.persist_parameters('0')
 
-        if self._params_task:
-            self._queue_push('start', {'input_paths': [self._params_task]})
-        else:
-            self._queue_push('start', {})
+        self._logger("Generating Argo YAML from Metaflow spec.")
 
-        progress_tstamp = time.time()
-        try:
-            # main scheduling loop
-            exception = None
-            while self._run_queue or\
-                    self._num_active_workers > 0:
+        yaml = YAML
 
-                # 1. are any of the current workers finished?
-                finished_tasks = list(self._poll_workers())
-                # 2. push new tasks triggered by the finished tasks to the queue
-                self._queue_tasks(finished_tasks)
-                # 3. if there are available worker slots, pop and start tasks
-                #    from the queue.
-                self._launch_workers()
+        env_base = "      - name: {}\n        value: \"{}\"\n"
+        env_text = list()
 
-                if time.time() - progress_tstamp > PROGRESS_INTERVAL:
-                    progress_tstamp = time.time()
-                    msg = "%d tasks are running: %s." %\
-                          (self._num_active_workers, 'e.g. ...')  # TODO
-                    self._logger(msg, system_msg=True)
-                    msg = "%d tasks are waiting in the queue." %\
-                          len(self._run_queue)
-                    self._logger(msg, system_msg=True)
-                    msg = "%d steps are pending: %s." %\
-                          (0, 'e.g. ...')  # TODO
-                    self._logger(msg, system_msg=True)
+        def put_env(key, value, s=env_text):
+            s.extend(list(env_base.format(key, value)))
 
-        except KeyboardInterrupt as ex:
-            self._logger('Workflow interrupted.', system_msg=True, bad=True)
-            self._killall()
-            exception = ex
-            raise
-        except Exception as ex:
-            self._logger('Workflow failed.', system_msg=True, bad=True)
-            self._killall()
-            exception = ex
-            raise
-        finally:
-            # on finish clean tasks
-            for step in self._flow:
-                for deco in step.decorators:
-                    deco.runtime_finished(exception)
+        import json
+        # code_package_url = "{}/{}/data/{}/{}".format(DATASTORE_SYSROOT_S3, self._flow.name, str(self._package.sha)[:2],
+        #                                              str(self._package.sha))
+        from metaflow.datastore.datastore import TransformableObject
+        self._ds = self._datastore(self._flow.name,
+                                   run_id=self.run_id,
+                                   mode='w')
+        code_package_url = self._ds.save_data(self._package.sha, TransformableObject(self._package.blob))
 
-        # assert that end was executed and it was successful
-        if ('end', ()) in self._finished:
-            self._logger('Done!', system_msg=True)
-        else:
-            raise MetaflowInternalError('The *end* step was not successful '
-                                        'by the end of flow.')
+        put_env("METAFLOW_CODE_SHA", self._package.sha)
+        put_env('METAFLOW_CODE_URL', code_package_url)
+        put_env('METAFLOW_CODE_DS', 's3')
+        put_env('METAFLOW_USER', 'user')
+        put_env('METAFLOW_SERVICE_URL', BATCH_METADATA_SERVICE_URL)
+        put_env('METAFLOW_SERVICE_HEADERS', json.dumps(BATCH_METADATA_SERVICE_HEADERS))
+        put_env('METAFLOW_DATASTORE_SYSROOT_S3', DATASTORE_SYSROOT_S3)
+        put_env('METAFLOW_DATATOOLS_S3ROOT', DATATOOLS_S3ROOT)
+        put_env('METAFLOW_DEFAULT_DATASTORE', 's3')
+        put_env('AWS_ACCESS_KEY_ID', AWS_ACCESS_KEY_ID)
+        put_env('AWS_SECRET_ACCESS_KEY', AWS_SECRET_ACCESS_KEY)
+        put_env('AWS_DEFAULT_REGION', AWS_DEFAULT_REGION)
+
+        i = 0
+        steps = []
+
+        j = 1
+        task_to_nums = {}
+
+        for node in self._graph.nodes:
+            node = self._graph.nodes[node]
+            node_name = node.name
+            preds = node.in_funcs
+            succs = node.out_funcs
+
+            if node_name not in task_to_nums:
+                task_to_nums[node_name] = j
+                j += 1
+            for n in preds:
+                if n not in task_to_nums:
+                    task_to_nums[n] = j
+                    j += 1
+            for n in succs:
+                if n not in task_to_nums:
+                    task_to_nums[n] = j
+                    j += 1
+
+            if len(preds) == 0:
+                inp = "_parameters/0"
+            else:
+                inp = ""
+                if len(preds) > 1:
+                    inp += ":"
+                for p in preds:
+                    inp += "{}/{},".format(p, task_to_nums[p])
+                inp = inp[:-1]
+
+            s = STEP
+            s = s.replace('$NAME', "thisisastring" + str(i))
+
+            args = """set -e && echo 'Setting up task environment.' && python -m pip install awscli click requests boto3
+            --user -qqq && mkdir metaflow && cd metaflow && mkdir .metaflow && i=0; while [ $i -le 5 ]; do echo 
+            'Downloading code package.'; python -m awscli s3 cp {} job.tar >/dev/null && echo 'Code package downloaded.'
+            && break; sleep 10; i=$((i+1));done  && tar xf job.tar && 
+            python -m pip install kubernetes --user -qqq && echo 'Task is starting.' && python -u {} --quiet 
+            --metadata service --environment local --datastore s3 --event-logger nullSidecarLogger --monitor 
+            nullSidecarMonitor --datastore-root {} --with 
+            kube:cpu=2,gpu=0,memory=4000,image=python:3.6,kube_namespace=default --package-suffixes .py --pylint step 
+            {} --run-id {} --task-id {} --input-paths ${{METAFLOW_INPUT_PATHS_0}}""".format(
+                code_package_url, self._flow.script_name, DATASTORE_SYSROOT_S3, node_name, 
+                self._run_id, task_to_nums[node_name]).replace('\n', ' ')
+            s = s.replace('$ARGS', args)
+
+            input_path = "\"{}/{}\"".format(self._run_id, inp)
+            s = s.replace('$INPUT_PATH', input_path)
+
+            steps.append(s)
+            i += 1
+
+        env_text = "".join(env_text)[:-1]
+        yaml = yaml.replace("$ENV", env_text)
+        yaml = yaml.replace("$STEPS", "\n".join(steps))
+        yaml = yaml.replace('$MEMORY', '4000')
+        yaml = yaml.replace('$CPU', '2')
+        print(yaml)
+
+        # self._logger('Workflow starting (run-id %s):' % self._run_id,
+        #              system_msg=True)
+        #
+        # if self._params_task:
+        #     self._queue_push('start', {'input_paths': [self._params_task]})
+        # else:
+        #     self._queue_push('start', {})
+        #
+        # progress_tstamp = time.time()
+        # try:
+        #     # main scheduling loop
+        #     exception = None
+        #     while self._run_queue or\
+        #             self._num_active_workers > 0:
+        #
+        #         # 1. are any of the current workers finished?
+        #         finished_tasks = list(self._poll_workers())
+        #         # 2. push new tasks triggered by the finished tasks to the queue
+        #         self._queue_tasks(finished_tasks)
+        #         # 3. if there are available worker slots, pop and start tasks
+        #         #    from the queue.
+        #         self._launch_workers()
+        #
+        #         if time.time() - progress_tstamp > PROGRESS_INTERVAL:
+        #             progress_tstamp = time.time()
+        #             msg = "%d tasks are running: %s." %\
+        #                   (self._num_active_workers, 'e.g. ...')  # TODO
+        #             self._logger(msg, system_msg=True)
+        #             msg = "%d tasks are waiting in the queue." %\
+        #                   len(self._run_queue)
+        #             self._logger(msg, system_msg=True)
+        #             msg = "%d steps are pending: %s." %\
+        #                   (0, 'e.g. ...')  # TODO
+        #             self._logger(msg, system_msg=True)
+        #
+        # except KeyboardInterrupt as ex:
+        #     self._logger('Workflow interrupted.', system_msg=True, bad=True)
+        #     self._killall()
+        #     exception = ex
+        #     raise
+        # except Exception as ex:
+        #     self._logger('Workflow failed.', system_msg=True, bad=True)
+        #     self._killall()
+        #     exception = ex
+        #     raise
+        # finally:
+        #     # on finish clean tasks
+        #     for step in self._flow:
+        #         for deco in step.decorators:
+        #             deco.runtime_finished(exception)
+        #
+        # # assert that end was executed and it was successful
+        # if ('end', ()) in self._finished:
+        #     self._logger('Done!', system_msg=True)
+        # else:
+        #     raise MetaflowInternalError('The *end* step was not successful '
+        #                                 'by the end of flow.')
 
     def _killall(self):
         # If we are here, all children have received a signal and are shutting down.
