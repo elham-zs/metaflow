@@ -2,6 +2,7 @@
 Instead of actually executing a metaflow spec this version just generates an Argo workflow YAML on stdout which can then in turn orchestrate the whole DAG on top of Argo instead of orchestrating it natively via metaflow runtime.
 
 ## Limitations
+* build the yaml in a proper tree-based way instead of string manipulations
 * currently not parsing the DAG properly; just sequentializing all steps (not exploiting potential concurrencies)
 * template is currently fixed to a python image; this needs more flexibility in the final version
 * no step placeholders for resource requirements
