@@ -49,7 +49,17 @@ PREFETCH_DATA_ARTIFACTS = ['_foreach_stack', '_task_ok', '_transition']
 
 # TODO option: output dot graph periodically about execution
 
-STEP = """    - - name: $NAME
+STEP_SEQ = """    - - name: $NAME
+        template: python
+        arguments:
+          parameters: 
+          - name: input_path
+            value: $INPUT_PATH
+          - name: arguments
+            value: $ARGS
+"""
+
+STEP_CON = """      - name: $NAME
         template: python
         arguments:
           parameters: 
@@ -73,7 +83,7 @@ spec:
       - name: arguments
       - name: input_path
     container:
-      image: "python:3.6"
+      image: "amancevice/pandas:0.24.2"
       command: ["/bin/sh"]
       args: ["-c", "{{inputs.parameters.arguments}}"]
       env:
@@ -258,13 +268,59 @@ class NativeRuntime(object):
         put_env('AWS_SECRET_ACCESS_KEY', AWS_SECRET_ACCESS_KEY)
         put_env('AWS_DEFAULT_REGION', AWS_DEFAULT_REGION)
 
-        i = 0
         steps = []
 
         j = 1
         task_to_nums = {}
 
+        processed_nodes = {}
+
+
+        from collections import defaultdict
+        dfs_succs = {}
+        dfs_preds = defaultdict(set)
+
+        def get_node(_id):
+            return self._graph.nodes[_id]
+
+        def dfs(node):
+            if node in dfs_succs:
+                return dfs_succs[node]
+
+            successors = set()
+            successors.add(node.name)
+
+            for succ in node.out_funcs:
+                succ = get_node(succ)
+                successors = successors.union(dfs(succ))
+
+            if node not in dfs_succs:
+                dfs_succs[node] = successors
+            return successors
+
+        import collections
+        root_node = collections.OrderedDict(self._graph.nodes.items()).popitem(False)[1]
+
+        # process DFS once s.t. we can build dfs_preds
+        dfs(root_node)
+
+        for node in dfs_succs:
+            for succ in dfs_succs[node]:
+                dfs_preds[succ].add(node.name)
+
+        for node in dfs_preds:
+            dfs_preds[node] = dfs_preds[node] - set([node])
+
+        def concurrent_to(node):
+            nodes = set(self._graph.nodes)
+            succs = dfs(node)
+            return nodes - succs - dfs_preds[node.name]
+
         for node in self._graph.nodes:
+            if node in processed_nodes:
+                continue
+            processed_nodes[node] = True
+
             node = self._graph.nodes[node]
             node_name = node.name
             preds = node.in_funcs
@@ -292,8 +348,11 @@ class NativeRuntime(object):
                     inp += "{}/{},".format(p, task_to_nums[p])
                 inp = inp[:-1]
 
-            s = STEP
-            s = s.replace('$NAME', "thisisastring" + str(i))
+            # get concurrent nodes and generate steps for them as well
+            # put them into the processed_nodes to avoid recomputing
+
+            s = STEP_SEQ
+            s = s.replace('$NAME', node_name)
 
             args = """set -e && echo 'Setting up task environment.' && python -m pip install awscli click requests boto3
             --user -qqq && mkdir metaflow && cd metaflow && mkdir .metaflow && i=0; while [ $i -le 5 ]; do echo 
@@ -311,8 +370,30 @@ class NativeRuntime(object):
             input_path = "\"{}/{}\"".format(self._run_id, inp)
             s = s.replace('$INPUT_PATH', input_path)
 
+            concurrent_steps = concurrent_to(node)
+            for step in concurrent_steps:
+                processed_nodes[self._graph.nodes[step]] = True
+
+                s = STEP_CON
+                s = s.replace('$NAME', step)
+
+                args = """set -e && echo 'Setting up task environment.' && python -m pip install awscli click requests boto3
+                --user -qqq && mkdir metaflow && cd metaflow && mkdir .metaflow && i=0; while [ $i -le 5 ]; do echo 
+                'Downloading code package.'; python -m awscli s3 cp {} job.tar >/dev/null && echo 'Code package downloaded.'
+                && break; sleep 10; i=$((i+1));done  && tar xf job.tar && 
+                python -m pip install kubernetes --user -qqq && echo 'Task is starting.' && python -u {} --quiet 
+                --metadata service --environment local --datastore s3 --event-logger nullSidecarLogger --monitor 
+                nullSidecarMonitor --datastore-root {} --with 
+                kube:cpu=2,gpu=0,memory=4000,image=python:3.6,kube_namespace=default --package-suffixes .py --pylint step 
+                {} --run-id {} --task-id {} --input-paths ${{METAFLOW_INPUT_PATHS_0}}""".format(
+                    code_package_url, self._flow.script_name, DATASTORE_SYSROOT_S3, step,
+                    self._run_id, task_to_nums[step]).replace('\n', ' ')
+                s = s.replace('$ARGS', args)
+
+                input_path = "\"{}/{}\"".format(self._run_id, inp)
+                s = s.replace('$INPUT_PATH', input_path)
+
             steps.append(s)
-            i += 1
 
         env_text = "".join(env_text)[:-1]
         yaml = yaml.replace("$ENV", env_text)
