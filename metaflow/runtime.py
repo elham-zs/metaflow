@@ -355,7 +355,7 @@ class NativeRuntime(object):
                         nullSidecarMonitor --datastore-root {} --with 
                         kube:cpu=2,gpu=0,memory=4000,image=python:3.6,kube_namespace=default --package-suffixes .py --pylint step 
                         {} --run-id {} --task-id {} --input-paths ${{METAFLOW_INPUT_PATHS_0}}""".format(
-                code_package_url, self._flow.script_name, DATASTORE_SYSROOT_S3, node_name.replace('_', '-'),
+                code_package_url, self._flow.script_name, DATASTORE_SYSROOT_S3, node_name,
                 self._run_id, task_to_nums[node_name]).replace('\n', ' ')
             s = s.replace('$ARGS', args)
 
