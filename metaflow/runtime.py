@@ -47,6 +47,8 @@ PROGRESS_INTERVAL = 1000 #ms
 # leveraging the MetaflowDatastoreSet.
 PREFETCH_DATA_ARTIFACTS = ['_foreach_stack', '_task_ok', '_transition']
 
+j = 1
+
 # TODO option: output dot graph periodically about execution
 
 STEP_SEQ = """    - - name: $NAME
@@ -269,12 +271,8 @@ class NativeRuntime(object):
         put_env('AWS_DEFAULT_REGION', AWS_DEFAULT_REGION)
 
         steps = []
-
-        j = 1
         task_to_nums = {}
-
         processed_nodes = {}
-
 
         from collections import defaultdict
         dfs_succs = {}
@@ -316,13 +314,13 @@ class NativeRuntime(object):
             succs = dfs(node)
             return nodes - succs - dfs_preds[node.name]
 
-        for node in self._graph.nodes:
-            if node in processed_nodes:
-                continue
-            processed_nodes[node] = True
+        def generate_step(node, is_concurrent):
+            global j
+            s = STEP_CON if is_concurrent else STEP_SEQ
 
-            node = self._graph.nodes[node]
             node_name = node.name
+            s = s.replace('$NAME', node_name.replace('_', '-'))
+
             preds = node.in_funcs
             succs = node.out_funcs
 
@@ -348,52 +346,39 @@ class NativeRuntime(object):
                     inp += "{}/{},".format(p, task_to_nums[p])
                 inp = inp[:-1]
 
-            # get concurrent nodes and generate steps for them as well
-            # put them into the processed_nodes to avoid recomputing
-
-            s = STEP_SEQ
-            s = s.replace('$NAME', node_name)
-
             args = """set -e && echo 'Setting up task environment.' && python -m pip install awscli click requests boto3
-            --user -qqq && mkdir metaflow && cd metaflow && mkdir .metaflow && i=0; while [ $i -le 5 ]; do echo 
-            'Downloading code package.'; python -m awscli s3 cp {} job.tar >/dev/null && echo 'Code package downloaded.'
-            && break; sleep 10; i=$((i+1));done  && tar xf job.tar && 
-            python -m pip install kubernetes --user -qqq && echo 'Task is starting.' && python -u {} --quiet 
-            --metadata service --environment local --datastore s3 --event-logger nullSidecarLogger --monitor 
-            nullSidecarMonitor --datastore-root {} --with 
-            kube:cpu=2,gpu=0,memory=4000,image=python:3.6,kube_namespace=default --package-suffixes .py --pylint step 
-            {} --run-id {} --task-id {} --input-paths ${{METAFLOW_INPUT_PATHS_0}}""".format(
-                code_package_url, self._flow.script_name, DATASTORE_SYSROOT_S3, node_name, 
+                        --user -qqq && mkdir metaflow && cd metaflow && mkdir .metaflow && i=0; while [ $i -le 5 ]; do echo 
+                        'Downloading code package.'; python -m awscli s3 cp {} job.tar >/dev/null && echo 'Code package downloaded.'
+                        && break; sleep 10; i=$((i+1));done  && tar xf job.tar && 
+                        python -m pip install kubernetes --user -qqq && echo 'Task is starting.' && python -u {} --quiet 
+                        --metadata service --environment local --datastore s3 --event-logger nullSidecarLogger --monitor 
+                        nullSidecarMonitor --datastore-root {} --with 
+                        kube:cpu=2,gpu=0,memory=4000,image=python:3.6,kube_namespace=default --package-suffixes .py --pylint step 
+                        {} --run-id {} --task-id {} --input-paths ${{METAFLOW_INPUT_PATHS_0}}""".format(
+                code_package_url, self._flow.script_name, DATASTORE_SYSROOT_S3, node_name.replace('_', '-'),
                 self._run_id, task_to_nums[node_name]).replace('\n', ' ')
             s = s.replace('$ARGS', args)
 
             input_path = "\"{}/{}\"".format(self._run_id, inp)
             s = s.replace('$INPUT_PATH', input_path)
+            return s
+
+        for node in self._graph.nodes:
+            node = self._graph.nodes[node]
+            if node in processed_nodes:
+                continue
+            processed_nodes[node] = True
+
+            s = generate_step(node, False)
+            steps.append(s)
 
             concurrent_steps = concurrent_to(node)
             for step in concurrent_steps:
-                processed_nodes[self._graph.nodes[step]] = True
+                node = self._graph.nodes[step]
+                processed_nodes[node] = True
 
-                s = STEP_CON
-                s = s.replace('$NAME', step)
-
-                args = """set -e && echo 'Setting up task environment.' && python -m pip install awscli click requests boto3
-                --user -qqq && mkdir metaflow && cd metaflow && mkdir .metaflow && i=0; while [ $i -le 5 ]; do echo 
-                'Downloading code package.'; python -m awscli s3 cp {} job.tar >/dev/null && echo 'Code package downloaded.'
-                && break; sleep 10; i=$((i+1));done  && tar xf job.tar && 
-                python -m pip install kubernetes --user -qqq && echo 'Task is starting.' && python -u {} --quiet 
-                --metadata service --environment local --datastore s3 --event-logger nullSidecarLogger --monitor 
-                nullSidecarMonitor --datastore-root {} --with 
-                kube:cpu=2,gpu=0,memory=4000,image=python:3.6,kube_namespace=default --package-suffixes .py --pylint step 
-                {} --run-id {} --task-id {} --input-paths ${{METAFLOW_INPUT_PATHS_0}}""".format(
-                    code_package_url, self._flow.script_name, DATASTORE_SYSROOT_S3, step,
-                    self._run_id, task_to_nums[step]).replace('\n', ' ')
-                s = s.replace('$ARGS', args)
-
-                input_path = "\"{}/{}\"".format(self._run_id, inp)
-                s = s.replace('$INPUT_PATH', input_path)
-
-            steps.append(s)
+                s = generate_step(node, True)
+                steps.append(s)
 
         env_text = "".join(env_text)[:-1]
         yaml = yaml.replace("$ENV", env_text)
