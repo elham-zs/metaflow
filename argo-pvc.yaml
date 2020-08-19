@@ -1,0 +1,67 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: metaflow-on-argo-new
+spec:
+  entrypoint: steps
+  volumeClaimTemplates:
+    - metadata:
+        name: workdir
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 1Gi
+  templates:
+  - name: python
+    inputs:
+      parameters:
+      - name: arguments
+      - name: input_path
+      artifacts:
+        - name: message_new3
+          path: /art
+          s3:
+            endpoint: s3.amazonaws.com
+            bucket: test-metaflow-martin
+            key: sysroot/
+            accessKeySecret:
+              name: my-s3-credentials
+              key: accessKey
+            secretKeySecret:
+              name: my-s3-credentials
+              key: secretKey
+    container:
+      image: "amancevice/pandas:0.24.2"
+      command: ["/bin/sh"]
+      args: ["-c", "{{inputs.parameters.arguments}}"]
+      env:
+      - name: METAFLOW_INPUT_PATHS_0
+        value: "{{inputs.parameters.input_path}}"
+      - name: METAFLOW_CODE_SHA
+        value: "1ce27ebc330f6f7abb168511647489a8d26b038f"
+      - name: METAFLOW_CODE_URL
+        value: "/art/PlayListFlow/data/1c/1ce27ebc330f6f7abb168511647489a8d26b038f"
+      - name: METAFLOW_CODE_DS
+        value: "s3"
+      - name: METAFLOW_USER
+        value: "user"
+      - name: METAFLOW_SERVICE_URL
+        value: "http://54.216.23.152:8080"
+      - name: METAFLOW_SERVICE_HEADERS
+        value: "{}"
+      - name: METAFLOW_DATASTORE_SYSROOT_S3
+        value: "s3://test-metaflow-martin/sysroot"
+      - name: METAFLOW_DATATOOLS_S3ROOT
+        value: "s3://test-metaflow-martin/sysroot/data"
+      - name: METAFLOW_DEFAULT_DATASTORE
+        value: "s3"
+      resources:
+        limits:
+          memory: 4000Mi
+          cpu: 2
+      volumeMounts:
+        - name: workdir
+          mountPath: /mnt/data
+  - name: steps
+    steps:

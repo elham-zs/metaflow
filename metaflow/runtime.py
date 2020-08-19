@@ -51,56 +51,9 @@ j = 1
 
 # TODO option: output dot graph periodically about execution
 
-STEP_SEQ = """    - - name: $NAME
-        template: python
-        arguments:
-          parameters: 
-          - name: input_path
-            value: $INPUT_PATH
-          - name: arguments
-            value: $ARGS
-"""
-
-STEP_CON = """      - name: $NAME
-        template: python
-        arguments:
-          parameters: 
-          - name: input_path
-            value: $INPUT_PATH
-          - name: arguments
-            value: $ARGS
-
-"""
-
-YAML = """apiVersion: argoproj.io/v1alpha1
-kind: Workflow
-metadata:
-  generateName: yamlisfuckingstupid
-spec:
-  entrypoint: steps
-  templates:
-  - name: python
-    inputs:
-      parameters:
-      - name: arguments
-      - name: input_path
-    container:
-      image: "amancevice/pandas:0.24.2"
-      command: ["/bin/sh"]
-      args: ["-c", "{{inputs.parameters.arguments}}"]
-      env:
-      - name: METAFLOW_INPUT_PATHS_0
-        value: "{{inputs.parameters.input_path}}"
-$ENV
-      resources:
-        limits:
-          memory: $MEMORYMi
-          cpu: $CPU
-  - name: steps
-    steps:
-$STEPS
-"""
-
+import ruamel.yaml as yaml
+with open(r"./argo-pvc.yaml") as f:
+    argo_con = yaml.safe_load(f)
 
 class NativeRuntime(object):
 
@@ -240,14 +193,6 @@ class NativeRuntime(object):
 
         self._logger("Generating Argo YAML from Metaflow spec.")
 
-        yaml = YAML
-
-        env_base = "      - name: {}\n        value: \"{}\"\n"
-        env_text = list()
-
-        def put_env(key, value, s=env_text):
-            s.extend(list(env_base.format(key, value)))
-
         import json
         # code_package_url = "{}/{}/data/{}/{}".format(DATASTORE_SYSROOT_S3, self._flow.name, str(self._package.sha)[:2],
         #                                              str(self._package.sha))
@@ -257,20 +202,6 @@ class NativeRuntime(object):
                                    mode='w')
         code_package_url = self._ds.save_data(self._package.sha, TransformableObject(self._package.blob))
 
-        put_env("METAFLOW_CODE_SHA", self._package.sha)
-        put_env('METAFLOW_CODE_URL', code_package_url)
-        put_env('METAFLOW_CODE_DS', 's3')
-        put_env('METAFLOW_USER', 'user')
-        put_env('METAFLOW_SERVICE_URL', BATCH_METADATA_SERVICE_URL)
-        put_env('METAFLOW_SERVICE_HEADERS', json.dumps(BATCH_METADATA_SERVICE_HEADERS))
-        put_env('METAFLOW_DATASTORE_SYSROOT_S3', DATASTORE_SYSROOT_S3)
-        put_env('METAFLOW_DATATOOLS_S3ROOT', DATATOOLS_S3ROOT)
-        put_env('METAFLOW_DEFAULT_DATASTORE', 's3')
-        put_env('AWS_ACCESS_KEY_ID', AWS_ACCESS_KEY_ID)
-        put_env('AWS_SECRET_ACCESS_KEY', AWS_SECRET_ACCESS_KEY)
-        put_env('AWS_DEFAULT_REGION', AWS_DEFAULT_REGION)
-
-        steps = []
         task_to_nums = {}
         processed_nodes = {}
 
@@ -316,10 +247,12 @@ class NativeRuntime(object):
 
         def generate_step(node, is_concurrent):
             global j
-            s = STEP_CON if is_concurrent else STEP_SEQ
+            step = {}
 
             node_name = node.name
-            s = s.replace('$NAME', node_name.replace('_', '-'))
+            step['name'] = node_name.replace('_', '-')
+            step['template'] = "python"
+            parameters = []
 
             preds = node.in_funcs
             succs = node.out_funcs
@@ -357,35 +290,36 @@ class NativeRuntime(object):
                         {} --run-id {} --task-id {} --input-paths ${{METAFLOW_INPUT_PATHS_0}}""".format(
                 code_package_url, self._flow.script_name, DATASTORE_SYSROOT_S3, node_name,
                 self._run_id, task_to_nums[node_name]).replace('\n', ' ')
-            s = s.replace('$ARGS', args)
 
             input_path = "\"{}/{}\"".format(self._run_id, inp)
-            s = s.replace('$INPUT_PATH', input_path)
-            return s
-
+            parameters.append({"name": "input_path", "value": input_path})
+            parameters.append({"name": "arguments", "value": args})
+            step["arguments"] = {'parameters': parameters}
+            return step
+        steps = []
         for node in self._graph.nodes:
             node = self._graph.nodes[node]
             if node in processed_nodes:
                 continue
             processed_nodes[node] = True
 
-            s = generate_step(node, False)
-            steps.append(s)
+            step = generate_step(node, False)
+            steps.append([step])
 
             concurrent_steps = concurrent_to(node)
             for step in concurrent_steps:
                 node = self._graph.nodes[step]
                 processed_nodes[node] = True
 
-                s = generate_step(node, True)
-                steps.append(s)
+                step = generate_step(node, True)
+                steps.append([step])
 
-        env_text = "".join(env_text)[:-1]
-        yaml = yaml.replace("$ENV", env_text)
-        yaml = yaml.replace("$STEPS", "\n".join(steps))
-        yaml = yaml.replace('$MEMORY', '4000')
-        yaml = yaml.replace('$CPU', '2')
-        print(yaml)
+        argo_con['spec']['templates'][1]['steps'] = steps
+
+        print(steps)
+
+        with open("./generate-argo.yaml", "w") as f:
+            yaml.round_trip_dump(argo_con, f, default_flow_style=False)
 
         # self._logger('Workflow starting (run-id %s):' % self._run_id,
         #              system_msg=True)
